@@ -10,11 +10,16 @@
 
 - **三档强度**：
   - `safe`（默认）：安全清理与保守优化，适合日常/定期运行
-  - `standard`：更积极（默认包含旧内核清理、Snap disabled 旧版本清理等）
-  - `aggressive`：会清理更多可再生缓存（如构建/包管理缓存），更适合“我知道我在做什么”的场景
+  - `standard`：更积极（默认包含旧内核清理、Snap disabled 旧版本清理、Docker 容器 json 日志截断等）
+  - `aggressive`：尽可能释放空间（可能清理更多缓存/残留），适合“我知道我在做什么”的场景
 - **可重复执行**：大多数操作幂等；`sysctl` 采用 drop-in 文件持久化（默认写入 `/etc/sysctl.d/99-ubuntu-cleanup.conf`）
-- **Docker 安全策略**：默认**不删除容器**、**不删除卷**、**不删除命名镜像**；仅清理悬空镜像、构建缓存、未使用网络
-- **日志与临时文件**：支持 `journalctl --vacuum-*`、截断超大 `.log` 文件（保留文件名更安全）、清理 `/tmp` 与 `/var/tmp`
+- **Docker 安全策略**：默认**不删除容器**、**不删除卷**、**不删除命名镜像**；仅清理悬空镜像、构建缓存、未使用网络；可选截断 `*-json.log`
+- **日志与临时文件**：
+  - `journalctl --vacuum-*`（先 `--rotate`，让清理更彻底）
+  - 删除旧的轮转/压缩日志（`/var/log/*.gz|*.xz|*.bz2|*.log.N`）
+  - 截断超大 `.log` 文件（保留文件名更安全）
+  - `systemd-tmpfiles --clean` + 清理 `/tmp` 与 `/var/tmp`
+- **崩溃/核心转储清理**：可选清理 `/var/lib/systemd/coredump` 与 `/var/crash`
 - **交互确认 + 自动确认**：默认逐步确认；支持 `--yes` / `AUTO_CONFIRM=true`
 
 ## ⚠️ 重要警告

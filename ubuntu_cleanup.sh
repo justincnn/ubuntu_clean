@@ -34,6 +34,11 @@ TMP_DELETE_AFTER_DAYS=1
 # /var/log 大文件截断阈值
 TRUNCATE_LOGS_OVER="50M"
 
+# 轮转/压缩日志删除：删除 /var/log 下 *.gz/*.xz/*.bz2/*.log.N 等
+# 注意：默认只删除“旧的”轮转日志，避免影响当日排障
+ROTATED_LOG_DELETE_AFTER_DAYS=7
+DO_ROTATED_LOG_CLEAN=true
+
 # 是否执行：旧内核清理（默认 standard/aggressive 才会执行）
 DO_KERNEL_CLEAN=false
 
@@ -43,7 +48,12 @@ DO_SNAP_CLEAN=false
 # 是否执行：Docker 清理（检测到 docker 才会运行；默认安全策略）
 DO_DOCKER_CLEAN=true
 
-# 是否执行：常见开发/构建缓存清理（aggressive 才默认开启）
+# 是否截断 Docker 容器 json 日志（/var/lib/docker/containers/*/*-json.log）
+# 这是 VPS 常见“空间杀手”，截断不影响容器运行，但会丢失历史日志。
+DO_DOCKER_LOG_TRUNCATE=false
+DOCKER_LOG_TRUNCATE_OVER="20M"
+
+# 是否执行：常见开发/构建缓存清理
 DO_DEV_CACHE_CLEAN=false
 
 # 是否执行：sysctl 优化（safe/standard/aggressive 都会执行“保守项”）
@@ -51,6 +61,13 @@ DO_SYSCTL_TUNE=true
 
 # 是否执行：fstrim（需要 SSD/支持 discard；可选）
 DO_FSTRIM=false
+
+# 是否清理系统崩溃转储/核心转储
+DO_COREDUMP_CLEAN=true
+
+# 是否清理 APT lists（/var/lib/apt/lists/*）
+# 这能释放空间，但下次 apt update 会重新下载。
+DO_APT_LISTS_CLEAN=false
 
 # 是否将 sysctl 永久写入 /etc/sysctl.d（比直接写 /etc/sysctl.conf 更干净）
 PERSIST_SYSCTL=true
@@ -140,9 +157,12 @@ usage() {
   --yes                               等同 AUTO_CONFIRM=true
   --no-docker                          跳过 Docker 清理
   --docker                             强制开启 Docker 清理
-  --kernel-clean                        清理旧内核（谨慎）
+  --docker-log-truncate                 截断 Docker 容器 json 日志（空间杀手，丢失历史日志）
+  --kernel-clean                        清理旧内核（谨慎，建议维护窗口）
   --snap-clean                          清理 Snap disabled 旧版本（检测到 snap 才生效）
-  --dev-cache-clean                     清理常见开发缓存（pip/npm/gradle 等，谨慎）
+  --dev-cache-clean                     清理常见开发/构建缓存（pip/npm/gradle 等，谨慎）
+  --apt-lists-clean                     清理 /var/lib/apt/lists/*（下次 apt update 会重下）
+  --no-coredump-clean                   跳过 coredump/crash 清理
   --fstrim                              执行 fstrim（支持 discard 时可提升 SSD 性能）
   --log-file /path/to/log               指定日志文件
   -h, --help                           显示帮助
@@ -167,12 +187,18 @@ parse_args() {
         DO_DOCKER_CLEAN=false; shift ;;
       --docker)
         DO_DOCKER_CLEAN=true; shift ;;
+      --docker-log-truncate)
+        DO_DOCKER_LOG_TRUNCATE=true; shift ;;
       --kernel-clean)
         DO_KERNEL_CLEAN=true; shift ;;
       --snap-clean)
         DO_SNAP_CLEAN=true; shift ;;
       --dev-cache-clean)
         DO_DEV_CACHE_CLEAN=true; shift ;;
+      --apt-lists-clean)
+        DO_APT_LISTS_CLEAN=true; shift ;;
+      --no-coredump-clean)
+        DO_COREDUMP_CLEAN=false; shift ;;
       --fstrim)
         DO_FSTRIM=true; shift ;;
       --log-file)
@@ -193,25 +219,37 @@ parse_args() {
 apply_mode_defaults() {
   case "$MODE" in
     safe)
-      JOURNAL_VACUUM_SIZE="200M"
+      # 日常可重复：保守清理
+      JOURNAL_VACUUM_SIZE="100M"
       JOURNAL_VACUUM_TIME="7d"
+      ROTATED_LOG_DELETE_AFTER_DAYS=14
       DO_KERNEL_CLEAN=false
       DO_SNAP_CLEAN=false
       DO_DEV_CACHE_CLEAN=false
+      DO_DOCKER_LOG_TRUNCATE=false
+      DO_APT_LISTS_CLEAN=false
       ;;
     standard)
-      JOURNAL_VACUUM_SIZE="100M"
-      JOURNAL_VACUUM_TIME="14d"
-      DO_KERNEL_CLEAN=true
-      DO_SNAP_CLEAN=true
-      DO_DEV_CACHE_CLEAN=false
-      ;;
-    aggressive)
+      # 空间更敏感：更积极但仍尽量安全
       JOURNAL_VACUUM_SIZE="50M"
-      JOURNAL_VACUUM_TIME="30d"
+      JOURNAL_VACUUM_TIME="14d"
+      ROTATED_LOG_DELETE_AFTER_DAYS=7
       DO_KERNEL_CLEAN=true
       DO_SNAP_CLEAN=true
       DO_DEV_CACHE_CLEAN=true
+      DO_DOCKER_LOG_TRUNCATE=true
+      DO_APT_LISTS_CLEAN=false
+      ;;
+    aggressive)
+      # 我知道我在做什么：尽可能释放空间
+      JOURNAL_VACUUM_SIZE="20M"
+      JOURNAL_VACUUM_TIME="30d"
+      ROTATED_LOG_DELETE_AFTER_DAYS=1
+      DO_KERNEL_CLEAN=true
+      DO_SNAP_CLEAN=true
+      DO_DEV_CACHE_CLEAN=true
+      DO_DOCKER_LOG_TRUNCATE=true
+      DO_APT_LISTS_CLEAN=true
       ;;
   esac
 }
@@ -233,11 +271,26 @@ clean_apt() {
   log_step "APT 清理"
   have_cmd apt-get || { log_warn "未发现 apt-get，跳过 APT 清理"; return 0; }
 
-  if confirm "执行 APT 清理（autoremove/clean）？"; then
+  if confirm "执行 APT 清理（autoremove/clean/autoclean）？"; then
     run dpkg --configure -a || true
     run apt-get -y update || true
+
+    # clean: 清空 /var/cache/apt/archives
     run apt-get -y clean
+
+    # autoclean: 清理过期 .deb
+    run apt-get -y autoclean || true
+
+    # autoremove: 卸载孤儿包
     run apt-get -y autoremove --purge
+
+    # 可选：清理 lists（可释放几十到几百 MB；下次 apt update 会重新下载）
+    if $DO_APT_LISTS_CLEAN; then
+      if confirm "清理 /var/lib/apt/lists/* 以进一步释放空间？"; then
+        run rm -rf /var/lib/apt/lists/*
+      fi
+    fi
+
     log_success "APT 清理完成"
   else
     log_info "跳过 APT 清理"
@@ -264,6 +317,15 @@ clean_docker_safe() {
     log_success "Docker 清理完成（未触碰容器/卷）"
   else
     log_info "跳过 Docker 清理"
+  fi
+
+  # Docker json 日志：大概率占用大量空间，截断是“保护系统”的常见做法
+  if $DO_DOCKER_LOG_TRUNCATE; then
+    log_warn "可选：截断 Docker 容器 json 日志（会丢失历史日志，但不会影响容器运行）"
+    if confirm "截断 /var/lib/docker/containers/*/*-json.log 中超过 $DOCKER_LOG_TRUNCATE_OVER 的日志文件？"; then
+      run find /var/lib/docker/containers -type f -name "*-json.log" -size "+$DOCKER_LOG_TRUNCATE_OVER" -exec truncate -s 0 {} \; || true
+      log_success "Docker json 日志截断完成"
+    fi
   fi
 }
 
@@ -304,13 +366,31 @@ clean_logs_and_tmp() {
   # journald
   if have_cmd journalctl; then
     if confirm "清理 Systemd Journal（size=$JOURNAL_VACUUM_SIZE, time=$JOURNAL_VACUUM_TIME）？"; then
+      # rotate 让 vacuum 更彻底
+      run journalctl --rotate || true
       run journalctl --vacuum-size="$JOURNAL_VACUUM_SIZE" --vacuum-time="$JOURNAL_VACUUM_TIME" || true
+    fi
+  fi
+
+  # 轮转/压缩日志：删除旧的 *.gz/*.xz/*.bz2/*.log.N 等
+  if $DO_ROTATED_LOG_CLEAN; then
+    if confirm "删除 /var/log 下轮转/压缩日志（mtime>$ROTATED_LOG_DELETE_AFTER_DAYS 天）？"; then
+      run find /var/log -type f \
+        \( -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -regex ".*\\.log\\.[0-9]+$" -o -regex ".*\\.[0-9]+$" \) \
+        -mtime "+$ROTATED_LOG_DELETE_AFTER_DAYS" -delete || true
     fi
   fi
 
   # /var/log 大文件截断（保留文件避免服务因 missing log 崩）
   if confirm "截断 /var/log 下超过 $TRUNCATE_LOGS_OVER 的 .log 文件（保留文件名）？"; then
     run find /var/log -type f -name "*.log" -size "+$TRUNCATE_LOGS_OVER" -exec truncate -s 0 {} \;
+  fi
+
+  # systemd-tmpfiles
+  if have_cmd systemd-tmpfiles; then
+    if confirm "执行 systemd-tmpfiles --clean（清理系统临时文件策略命中的条目）？"; then
+      run systemd-tmpfiles --clean || true
+    fi
   fi
 
   # /tmp /var/tmp
@@ -338,18 +418,54 @@ clean_dev_caches_aggressive() {
   fi
 
   log_warn "这会删除一些可再生缓存（可能导致下次构建/安装变慢）。不会删除项目源码。"
-  if ! confirm "确认清理常见开发缓存（pip/npm/yarn/gradle/maven/go/build 等）？"; then
+  if ! confirm "确认清理常见开发/构建缓存（pip/npm/yarn/pnpm/gradle/maven/go/rust 等）？"; then
     log_info "跳过开发缓存清理"
     return 0
   fi
 
   # root
-  run rm -rf /root/.cache/pip /root/.npm /root/.yarn /root/.gradle /root/.m2 /root/go/pkg/mod/cache || true
+  run rm -rf \
+    /root/.cache/pip \
+    /root/.cache/pypoetry \
+    /root/.cache/uv \
+    /root/.npm \
+    /root/.yarn \
+    /root/.pnpm-store \
+    /root/.gradle \
+    /root/.m2 \
+    /root/.cargo/registry \
+    /root/.cargo/git \
+    /root/.cache/go-build \
+    /root/go/pkg/mod/cache \
+    /root/.composer/cache \
+    /root/.cache/composer \
+    /root/.cache/ms-playwright \
+    /root/.cache/puppeteer \
+    /root/.cache/selenium \
+    || true
 
   # /home users
   for user_dir in /home/*; do
     [[ -d "$user_dir" ]] || continue
-    run rm -rf "$user_dir/.cache/pip" "$user_dir/.npm" "$user_dir/.yarn" "$user_dir/.gradle" "$user_dir/.m2" "$user_dir/go/pkg/mod/cache" || true
+    run rm -rf \
+      "$user_dir/.cache/pip" \
+      "$user_dir/.cache/pypoetry" \
+      "$user_dir/.cache/uv" \
+      "$user_dir/.npm" \
+      "$user_dir/.yarn" \
+      "$user_dir/.pnpm-store" \
+      "$user_dir/.gradle" \
+      "$user_dir/.m2" \
+      "$user_dir/.cargo/registry" \
+      "$user_dir/.cargo/git" \
+      "$user_dir/.cache/go-build" \
+      "$user_dir/go/pkg/mod/cache" \
+      "$user_dir/.composer/cache" \
+      "$user_dir/.cache/composer" \
+      "$user_dir/.cache/ms-playwright" \
+      "$user_dir/.cache/puppeteer" \
+      "$user_dir/.cache/selenium" \
+      || true
   done
 
   log_success "开发/构建缓存清理完成"
@@ -362,25 +478,70 @@ clean_old_kernels() {
     log_info "模式/配置未启用旧内核清理，跳过"
     return 0
   fi
-  have_cmd dpkg || { log_warn "未发现 dpkg，跳过"; return 0; }
   have_cmd apt-get || { log_warn "未发现 apt-get，跳过"; return 0; }
+  have_cmd dpkg-query || have_cmd dpkg || { log_warn "未发现 dpkg-query/dpkg，跳过"; return 0; }
 
-  local current_kernel pkgs
+  local current_kernel current_pkg
   current_kernel=$(uname -r)
+  current_pkg="linux-image-${current_kernel}"
 
-  # 仅清理 linux-image-*（更保守）；headers/modules 交给 autoremove
-  pkgs=$(dpkg --list | awk '/^ii  linux-image-[0-9]/{print $2}' | grep -v "${current_kernel}" || true)
-  if [[ -z "${pkgs}" ]]; then
-    log_info "未发现可清理的旧 linux-image 包"
+  # 收集已安装 linux-image-*，并按版本排序
+  local -a images
+  if have_cmd dpkg-query; then
+    mapfile -t images < <(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | sort -V)
+  else
+    mapfile -t images < <(dpkg --list | awk '/^ii  linux-image-[0-9]/{print $2}' | sort -V)
+  fi
+
+  if (( ${#images[@]} == 0 )); then
+    log_info "未发现 linux-image-* 包"
     return 0
   fi
 
-  log_warn "将移除以下旧内核包（不会移除当前运行内核: $current_kernel）："
-  echo "$pkgs" | sed 's/^/  - /'
+  # 保留：当前运行内核 + 最新一个内核（作为回滚）
+  local latest_pkg
+  latest_pkg="${images[-1]}"
 
-  if confirm "确认移除旧内核包并 update-grub？"; then
-    # shellcheck disable=SC2086
-    run apt-get -y purge $pkgs
+  local -a keep
+  keep=("$current_pkg")
+  if [[ "$latest_pkg" != "$current_pkg" ]]; then
+    keep+=("$latest_pkg")
+  fi
+
+  # 构造待删除列表：除 keep 之外的所有 linux-image-*（同时尽量带上 headers/modules）
+  local -a purge
+  local pkg
+  for pkg in "${images[@]}"; do
+    if [[ " $current_pkg $latest_pkg " == *" $pkg "* ]]; then
+      continue
+    fi
+
+    purge+=("$pkg")
+
+    # 提取版本后缀，用于匹配 headers/modules
+    local ver
+    ver="${pkg#linux-image-}"
+
+    # headers/modules/extra 可能存在也可能不存在；不存在不会影响 apt-get purge
+    purge+=("linux-headers-$ver" "linux-modules-$ver" "linux-modules-extra-$ver")
+  done
+
+  if (( ${#purge[@]} == 0 )); then
+    log_info "仅存在需要保留的内核（当前/最新），无需清理"
+    return 0
+  fi
+
+  log_warn "将移除旧内核相关包（保留: ${keep[*]}）："
+  printf '%s\n' "${purge[@]}" | awk 'NF' | sort -u | sed 's/^/  - /'
+
+  if confirm "确认移除旧内核包并 update-grub（建议维护窗口执行）？"; then
+    # 去重后 purge
+    # shellcheck disable=SC2046
+    run apt-get -y purge $(printf '%s\n' "${purge[@]}" | awk 'NF' | sort -u)
+
+    # 再做一次 autoremove，清掉残留依赖
+    run apt-get -y autoremove --purge
+
     if have_cmd update-grub; then
       run update-grub
     fi
@@ -436,6 +597,38 @@ tune_sysctl() {
   fi
 }
 
+# ------------------------------ 清理：coredump/crash ------------------------------
+clean_coredumps() {
+  log_step "coredump/crash 清理"
+  if ! $DO_COREDUMP_CLEAN; then
+    log_info "已配置跳过 coredump/crash 清理"
+    return 0
+  fi
+
+  local did=false
+
+  if [[ -d /var/lib/systemd/coredump ]]; then
+    log_warn "/var/lib/systemd/coredump 可能占用大量空间（核心转储）"
+    if confirm "删除 /var/lib/systemd/coredump 下所有文件？"; then
+      run rm -rf /var/lib/systemd/coredump/* || true
+      did=true
+    fi
+  fi
+
+  if [[ -d /var/crash ]]; then
+    if confirm "删除 /var/crash 下的崩溃报告文件？"; then
+      run rm -rf /var/crash/* || true
+      did=true
+    fi
+  fi
+
+  if $did; then
+    log_success "coredump/crash 清理完成"
+  else
+    log_info "未执行 coredump/crash 清理"
+  fi
+}
+
 # ------------------------------ 优化：fstrim ------------------------------
 fstrim_disks() {
   log_step "fstrim（可选）"
@@ -470,6 +663,7 @@ main() {
   clean_docker_safe
   clean_snap
   clean_logs_and_tmp
+  clean_coredumps
   clean_dev_caches_aggressive
   clean_old_kernels
   tune_sysctl
