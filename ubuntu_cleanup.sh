@@ -511,7 +511,8 @@ clean_old_kernels() {
   current_pkg="linux-image-${current_kernel}"
 
   # 收集已安装 linux-image-*，并按版本排序
-  local -a images
+  # 显式初始化为空数组，避免在 set -u 场景下出现 "unbound variable"
+  local -a images=()
   if have_cmd dpkg-query; then
     mapfile -t images < <(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null | sort -V)
   else
@@ -527,14 +528,15 @@ clean_old_kernels() {
   local latest_pkg
   latest_pkg="${images[-1]}"
 
-  local -a keep
+  local -a keep=()
   keep=("$current_pkg")
   if [[ "$latest_pkg" != "$current_pkg" ]]; then
     keep+=("$latest_pkg")
   fi
 
   # 构造待删除列表：除 keep 之外的所有 linux-image-*（同时尽量带上 headers/modules）
-  local -a purge
+  # 显式初始化为空数组，避免在 set -u 场景下出现 "unbound variable"
+  local -a purge=()
   local pkg
   for pkg in "${images[@]}"; do
     if [[ " $current_pkg $latest_pkg " == *" $pkg "* ]]; then
