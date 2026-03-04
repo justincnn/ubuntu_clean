@@ -1,209 +1,494 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ==============================================================================
-# 🚀 Ubuntu VPS 深度清理与性能优化脚本 (Pro版)
-# ==============================================================================
-# 功能：
-# 1. 磁盘清理：APT, Docker(安全模式), Snap, Systemd Logs, User Caches
-# 2. 性能优化：优化内存交换(Swap)策略，提升系统响应速度
-# 3. 安全机制：严格保护 Docker 容器，防止因 restart:no 导致的误删
+# Ubuntu VPS 深度清理与性能优化脚本
+# - 可重复执行 / 安全默认 / 支持 dry-run / 支持分步骤
+# - 面向 Docker 多容器 VPS：默认不删除容器与命名镜像，不触碰卷
 # ==============================================================================
 
-set -u
-set -o pipefail
+set -Eeuo pipefail
 
-# --- 配置区域 ---
-AUTO_CONFIRM=true
-LOG_FILE="/var/log/vps_cleanup_pro.log"
+# ------------------------------ 默认配置 ------------------------------
+VERSION="2.0.0"
 
-# Systemd 日志保留限制 (激进模式)
-JOURNAL_SIZE="50M"
+# 运行模式：safe | standard | aggressive
+MODE="safe"
 
-# --- 辅助函数 ---
-# 重定向输出到屏幕和日志文件
-exec > >(tee -a "$LOG_FILE") 2>&1
+# 是否自动确认（默认 false：交互确认更安全）
+AUTO_CONFIRM="${AUTO_CONFIRM:-false}"
 
-log_info() { echo -e "\033[36m[INFO]\033[0m $(date '+%H:%M:%S') $1"; }
-log_success() { echo -e "\033[32m[OK]\033[0m   $(date '+%H:%M:%S') $1"; }
-log_warn() { echo -e "\033[33m[WARN]\033[0m $(date '+%H:%M:%S') $1"; }
-log_step() { echo -e "\n\033[1;35m>> $1 \033[0m"; }
+# dry-run：仅打印将执行的命令，不实际执行
+DRY_RUN=false
 
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "❌ 错误：请使用 root 权限运行 (sudo bash ...)"
-        exit 1
-    fi
+# 日志文件（若不可写则回退到当前目录）
+LOG_FILE_DEFAULT="/var/log/ubuntu_cleanup.log"
+LOG_FILE="$LOG_FILE_DEFAULT"
+
+# journald 限制（safe/standard/aggressive 会各自设置默认值）
+JOURNAL_VACUUM_SIZE=""
+JOURNAL_VACUUM_TIME=""
+
+# 临时目录清理保留天数（mtime > N 天才删除）
+TMP_DELETE_AFTER_DAYS=1
+
+# /var/log 大文件截断阈值
+TRUNCATE_LOGS_OVER="50M"
+
+# 是否执行：旧内核清理（默认 standard/aggressive 才会执行）
+DO_KERNEL_CLEAN=false
+
+# 是否执行：Snap 清理（检测到 snap 才会运行；safe 模式只做 retain 设置）
+DO_SNAP_CLEAN=false
+
+# 是否执行：Docker 清理（检测到 docker 才会运行；默认安全策略）
+DO_DOCKER_CLEAN=true
+
+# 是否执行：常见开发/构建缓存清理（aggressive 才默认开启）
+DO_DEV_CACHE_CLEAN=false
+
+# 是否执行：sysctl 优化（safe/standard/aggressive 都会执行“保守项”）
+DO_SYSCTL_TUNE=true
+
+# 是否执行：fstrim（需要 SSD/支持 discard；可选）
+DO_FSTRIM=false
+
+# 是否将 sysctl 永久写入 /etc/sysctl.d（比直接写 /etc/sysctl.conf 更干净）
+PERSIST_SYSCTL=true
+SYSCTL_DROPIN="/etc/sysctl.d/99-ubuntu-cleanup.conf"
+
+# ------------------------------ 输出/日志 ------------------------------
+_color() { local c="$1"; shift; printf "\033[%sm%s\033[0m" "$c" "$*"; }
+log_info()    { echo -e "$(_color 36 [INFO]) $(date '+%F %T') $*"; }
+log_warn()    { echo -e "$(_color 33 [WARN]) $(date '+%F %T') $*"; }
+log_error()   { echo -e "$(_color 31 [ERR ]) $(date '+%F %T') $*"; }
+log_success() { echo -e "$(_color 32 [OK  ]) $(date '+%F %T') $*"; }
+log_step()    { echo -e "\n$(_color 35 '>>') $(_color 35 "$*")"; }
+
+die() { log_error "$*"; exit 1; }
+
+# ------------------------------ 工具函数 ------------------------------
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "请使用 root 权限运行：sudo bash $0 ... 或 sudo ./$0 ..."
+  fi
 }
 
-get_disk_usage() {
-    df / | awk 'NR==2 {print $3}'
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# 统一执行命令：支持 dry-run
+run() {
+  if $DRY_RUN; then
+    log_info "[dry-run] $*"
+    return 0
+  fi
+  log_info "执行: $*"
+  "$@"
 }
 
-format_size() {
-    numfmt --to=iec --suffix=B --padding=7 $1
+confirm() {
+  local prompt="$1"
+  if [[ "$AUTO_CONFIRM" == "true" ]]; then
+    log_info "AUTO_CONFIRM=true，自动确认：$prompt"
+    return 0
+  fi
+  read -r -p "$prompt [y/N] " ans || true
+  case "${ans,,}" in
+    y|yes) return 0 ;;
+    *)     return 1 ;;
+  esac
 }
 
-# --- 脚本开始 ---
-check_root
-log_info "开始执行深度清理与优化..."
-START_USAGE=$(get_disk_usage)
+bytes_used_rootfs() {
+  # df 输出单位为 1K-blocks
+  df -P / | awk 'NR==2 {print $3 * 1024}'
+}
 
-# ==============================================================================
-# 1. 系统包管理器深度清理 (APT)
-# ==============================================================================
-log_step "APT 深度清理"
+fmt_bytes() {
+  # 兼容大多数 Ubuntu：numfmt 通常可用；否则回退
+  local b="$1"
+  if have_cmd numfmt; then
+    numfmt --to=iec --suffix=B "$b"
+  else
+    echo "${b}B"
+  fi
+}
 
-# 修复潜在的依赖关系
-dpkg --configure -a
+setup_logging() {
+  # 若 /var/log 不可写（比如非 root / 或特殊系统），回退到当前目录
+  if ! ( : >>"$LOG_FILE" ) 2>/dev/null; then
+    LOG_FILE="./ubuntu_cleanup.log"
+  fi
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  log_info "日志文件: $LOG_FILE"
+}
 
-# 清理过期的安装包缓存
-apt-get clean -y
+on_err() {
+  local exit_code=$?
+  log_error "脚本出错 (exit=$exit_code)。请查看日志：$LOG_FILE"
+  exit "$exit_code"
+}
+trap on_err ERR
 
-# 移除不再需要的依赖包 (孤儿包)
-log_info "正在移除未使用的依赖包..."
-apt-get autoremove --purge -y
+usage() {
+  cat <<'EOF'
+用法:
+  sudo ./ubuntu_cleanup.sh [选项]
 
-# (可选) 如果安装了 deborphan，清理孤儿库
-if command -v deborphan &> /dev/null; then
-    log_info "使用 deborphan 清理孤儿库..."
-    deborphan | xargs -r apt-get -y remove --purge
-fi
+选项:
+  --mode {safe|standard|aggressive}   预设强度（默认 safe）
+  --dry-run                           仅打印命令，不执行
+  --yes                               等同 AUTO_CONFIRM=true
+  --no-docker                          跳过 Docker 清理
+  --docker                             强制开启 Docker 清理
+  --kernel-clean                        清理旧内核（谨慎）
+  --snap-clean                          清理 Snap disabled 旧版本（检测到 snap 才生效）
+  --dev-cache-clean                     清理常见开发缓存（pip/npm/gradle 等，谨慎）
+  --fstrim                              执行 fstrim（支持 discard 时可提升 SSD 性能）
+  --log-file /path/to/log               指定日志文件
+  -h, --help                           显示帮助
 
-# ==============================================================================
-# 2. Docker 资源清理 (严格安全模式)
-# ==============================================================================
-log_step "Docker 资源清理 (安全模式)"
+说明:
+  1) safe：默认不删容器/卷/命名镜像；只做安全释放空间与保守优化。
+  2) standard：在 safe 基础上更积极（包含旧内核、更多日志/缓存）。
+  3) aggressive：面向“我知道我在做什么”，可能清理更多缓存与残留。
+EOF
+}
 
-if command -v docker &> /dev/null; then
-    log_info "检测到 Docker。正在执行安全清理..."
-    log_warn "策略：保留所有容器(Container)和有标签的镜像。仅清理构建缓存和无名镜像。"
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mode)
+        MODE="${2:-}"; shift 2 ;;
+      --dry-run)
+        DRY_RUN=true; shift ;;
+      --yes)
+        AUTO_CONFIRM=true; shift ;;
+      --no-docker)
+        DO_DOCKER_CLEAN=false; shift ;;
+      --docker)
+        DO_DOCKER_CLEAN=true; shift ;;
+      --kernel-clean)
+        DO_KERNEL_CLEAN=true; shift ;;
+      --snap-clean)
+        DO_SNAP_CLEAN=true; shift ;;
+      --dev-cache-clean)
+        DO_DEV_CACHE_CLEAN=true; shift ;;
+      --fstrim)
+        DO_FSTRIM=true; shift ;;
+      --log-file)
+        LOG_FILE="${2:-}"; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        die "未知参数: $1（用 -h 查看帮助）" ;;
+    esac
+  done
 
-    # 1. 清理悬空镜像 (Dangling images): 标签为 <none> 的废弃镜像
-    # 这不会删除被停止容器使用的镜像
-    docker image prune -f
+  case "$MODE" in
+    safe|standard|aggressive) ;;
+    *) die "--mode 只能是 safe|standard|aggressive" ;;
+  esac
+}
 
-    # 2. 清理构建缓存 (Build Cache): 这是占用空间的隐形杀手
-    # 如果你频繁构建镜像，这能释放 GB 级空间
-    docker builder prune -f
+apply_mode_defaults() {
+  case "$MODE" in
+    safe)
+      JOURNAL_VACUUM_SIZE="200M"
+      JOURNAL_VACUUM_TIME="7d"
+      DO_KERNEL_CLEAN=false
+      DO_SNAP_CLEAN=false
+      DO_DEV_CACHE_CLEAN=false
+      ;;
+    standard)
+      JOURNAL_VACUUM_SIZE="100M"
+      JOURNAL_VACUUM_TIME="14d"
+      DO_KERNEL_CLEAN=true
+      DO_SNAP_CLEAN=true
+      DO_DEV_CACHE_CLEAN=false
+      ;;
+    aggressive)
+      JOURNAL_VACUUM_SIZE="50M"
+      JOURNAL_VACUUM_TIME="30d"
+      DO_KERNEL_CLEAN=true
+      DO_SNAP_CLEAN=true
+      DO_DEV_CACHE_CLEAN=true
+      ;;
+  esac
+}
 
-    # 3. 清理未使用的网络 (Network)
-    docker network prune -f
-    
-    log_success "Docker 清理完成 (未触碰容器)"
-else
-    log_info "未检测到 Docker，跳过。"
-fi
+print_detect() {
+  log_step "环境探测"
+  log_info "MODE=$MODE DRY_RUN=$DRY_RUN AUTO_CONFIRM=$AUTO_CONFIRM"
+  log_info "Docker: $(have_cmd docker && echo yes || echo no)"
+  log_info "Snap:   $(have_cmd snap && echo yes || echo no)"
+  if [[ -r /proc/meminfo ]]; then
+    local mem_kb
+    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || echo 0)
+    log_info "内存:   $((mem_kb/1024)) MiB"
+  fi
+}
 
-# ==============================================================================
-# 3. Snap 激进优化 (如果存在)
-# ==============================================================================
-if command -v snap &> /dev/null; then
-    log_step "Snap 优化与清理"
-    
-    # 设置 Snap 只保留 2 个版本 (默认是 3 个)
-    log_info "设置 Snap 保留限制为 2 个版本..."
-    snap set system refresh.retain=2
+# ------------------------------ 清理：APT ------------------------------
+clean_apt() {
+  log_step "APT 清理"
+  have_cmd apt-get || { log_warn "未发现 apt-get，跳过 APT 清理"; return 0; }
 
-    # 移除已禁用的旧版本 Snap
-    # 注意：这可能会短暂重启依赖 Snap 的服务
-    snap list --all | awk '/disabled/{print $1, $3}' | while read snapname revision; do
-        log_info "移除旧版本 Snap: $snapname (r$revision)"
-        snap remove "$snapname" --revision="$revision"
+  if confirm "执行 APT 清理（autoremove/clean）？"; then
+    run dpkg --configure -a || true
+    run apt-get -y update || true
+    run apt-get -y clean
+    run apt-get -y autoremove --purge
+    log_success "APT 清理完成"
+  else
+    log_info "跳过 APT 清理"
+  fi
+}
+
+# ------------------------------ 清理：Docker（安全） ------------------------------
+clean_docker_safe() {
+  log_step "Docker 清理（安全模式）"
+  if ! $DO_DOCKER_CLEAN; then
+    log_info "已配置跳过 Docker 清理"
+    return 0
+  fi
+  if ! have_cmd docker; then
+    log_info "未检测到 docker，跳过"
+    return 0
+  fi
+
+  log_warn "策略：不删除容器、不删除卷、不删除命名镜像；仅清理悬空镜像/构建缓存/未使用网络。"
+  if confirm "执行 Docker 安全清理？"; then
+    run docker image prune -f
+    run docker builder prune -f
+    run docker network prune -f
+    log_success "Docker 清理完成（未触碰容器/卷）"
+  else
+    log_info "跳过 Docker 清理"
+  fi
+}
+
+# ------------------------------ 清理：Snap ------------------------------
+clean_snap() {
+  log_step "Snap 清理"
+  if ! have_cmd snap; then
+    log_info "未检测到 snap，跳过"
+    return 0
+  fi
+
+  # 无论是否 aggressive，都可以安全设置 retain
+  if confirm "设置 Snap 保留版本为 2（refresh.retain=2）？"; then
+    run snap set system refresh.retain=2
+  fi
+
+  if ! $DO_SNAP_CLEAN; then
+    log_info "模式/配置未启用 Snap 旧版本清理，跳过"
+    return 0
+  fi
+
+  if confirm "移除 disabled 的旧版本 Snap（可能短暂影响 snap 服务）？"; then
+    # shellcheck disable=SC2016
+    snap list --all | awk '/disabled/{print $1, $3}' | while read -r snapname revision; do
+      [[ -n "${snapname:-}" && -n "${revision:-}" ]] || continue
+      run snap remove "$snapname" --revision="$revision"
     done
-fi
+    log_success "Snap disabled 旧版本清理完成"
+  else
+    log_info "跳过 Snap disabled 旧版本清理"
+  fi
+}
 
-# ==============================================================================
-# 4. 日志与缓存深度清理
-# ==============================================================================
-log_step "日志与应用缓存清理"
+# ------------------------------ 清理：日志/临时/缓存 ------------------------------
+clean_logs_and_tmp() {
+  log_step "日志与临时目录清理"
 
-# Systemd Journal 清理
-if command -v journalctl &> /dev/null; then
-    log_info "压缩 Systemd 日志至 $JOURNAL_SIZE..."
-    journalctl --vacuum-size=$JOURNAL_SIZE --vacuum-time=7d
-fi
-
-# 截断巨型日志文件 (保留文件但清空内容，比 rm 更安全)
-log_info "截断 /var/log 下超过 50MB 的旧日志文件..."
-find /var/log -type f -name "*.log" -size +50M -exec truncate -s 0 {} \;
-
-# 清理 /tmp 和 /var/tmp
-log_info "清理临时目录..."
-find /tmp -mindepth 1 -mtime +1 -delete
-find /var/tmp -mindepth 1 -mtime +1 -delete
-
-# 清理用户级缓存 (.cache) - 包含 root 和 /home/*
-# 这通常包含 pip, npm, yarn, thumbnails 等缓存
-log_info "清理用户缓存目录 (/root/.cache & /home/*/.cache)..."
-rm -rf /root/.cache/*
-for user_dir in /home/*; do
-    if [ -d "$user_dir/.cache" ]; then
-        # 仅删除缓存内容，保留目录结构
-        rm -rf "$user_dir/.cache"/*
-        log_info "已清理: $user_dir/.cache"
+  # journald
+  if have_cmd journalctl; then
+    if confirm "清理 Systemd Journal（size=$JOURNAL_VACUUM_SIZE, time=$JOURNAL_VACUUM_TIME）？"; then
+      run journalctl --vacuum-size="$JOURNAL_VACUUM_SIZE" --vacuum-time="$JOURNAL_VACUUM_TIME" || true
     fi
-done
+  fi
 
-# ==============================================================================
-# 5. 旧内核清理 (保留当前内核)
-# ==============================================================================
-log_step "旧内核清理"
-current_kernel=$(uname -r)
-# 提取所有内核包名，排除当前内核
-kernel_packages=$(dpkg --list | grep -E 'linux-image-[0-9]+' | awk '{ print $2 }' | grep -v "$current_kernel" | sort -V | head -n -1)
+  # /var/log 大文件截断（保留文件避免服务因 missing log 崩）
+  if confirm "截断 /var/log 下超过 $TRUNCATE_LOGS_OVER 的 .log 文件（保留文件名）？"; then
+    run find /var/log -type f -name "*.log" -size "+$TRUNCATE_LOGS_OVER" -exec truncate -s 0 {} \;
+  fi
 
-if [ -n "$kernel_packages" ]; then
-    log_info "发现旧内核，正在移除: $kernel_packages"
-    apt-get purge -y $kernel_packages
-    update-grub
-    log_success "旧内核已移除"
-else
-    log_info "未发现可清理的旧内核。"
-fi
+  # /tmp /var/tmp
+  if confirm "清理临时目录 /tmp 与 /var/tmp（删除 mtime>$TMP_DELETE_AFTER_DAYS 天的文件）？"; then
+    run find /tmp -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -delete
+    run find /var/tmp -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -delete
+  fi
 
-# ==============================================================================
-# 6. VPS 性能参数调优 (Sysctl)
-# ==============================================================================
-log_step "性能参数优化 (Sysctl)"
+  # 用户缓存：safe 模式只清理 root 的 apt/pip 等常见缓存目录的“安全子集”
+  if confirm "清理用户缓存（/root/.cache 与 /home/*/.cache 内容）？"; then
+    run rm -rf /root/.cache/* || true
+    for user_dir in /home/*; do
+      [[ -d "$user_dir/.cache" ]] || continue
+      run rm -rf "$user_dir/.cache"/* || true
+      log_info "已清理: $user_dir/.cache"
+    done
+  fi
+}
 
-# 1. 优化 Swappiness (降低对 Swap 的依赖)
-# 默认通常是 60，对于 VPS 来说太高了，会导致频繁读写硬盘。
-# 降低到 10，让系统尽可能用物理内存，提升速度。
-CURRENT_SWAP=$(cat /proc/sys/vm/swappiness)
-if [ "$CURRENT_SWAP" -gt 10 ]; then
-    log_info "优化 vm.swappiness (当前: $CURRENT_SWAP -> 目标: 10)"
-    sysctl -w vm.swappiness=10
-    echo "vm.swappiness=10" >> /etc/sysctl.conf
-else
-    log_info "vm.swappiness 已优化 ($CURRENT_SWAP)"
-fi
+clean_dev_caches_aggressive() {
+  log_step "开发/构建缓存清理（谨慎）"
+  if ! $DO_DEV_CACHE_CLEAN; then
+    log_info "未启用 dev-cache-clean，跳过"
+    return 0
+  fi
 
-# 2. 优化 VFS Cache Pressure
-# 增加到 50 (默认100)，让系统倾向于保留 inode/dentry 缓存，让文件访问更快
-# 注意：如果内存极小(<1GB)，保持 100 即可。
-MEM_TOTAL=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-if [ "$MEM_TOTAL" -gt 2000000 ]; then # 如果内存 > 2GB
-    log_info "内存充足，优化文件系统缓存保留..."
-    sysctl -w vm.vfs_cache_pressure=50
-fi
+  log_warn "这会删除一些可再生缓存（可能导致下次构建/安装变慢）。不会删除项目源码。"
+  if ! confirm "确认清理常见开发缓存（pip/npm/yarn/gradle/maven/go/build 等）？"; then
+    log_info "跳过开发缓存清理"
+    return 0
+  fi
 
-# ==============================================================================
-# 总结
-# ==============================================================================
-echo ""
-log_step "清理摘要"
-END_USAGE=$(get_disk_usage)
-FREED_SPACE=$((START_USAGE - END_USAGE))
+  # root
+  run rm -rf /root/.cache/pip /root/.npm /root/.yarn /root/.gradle /root/.m2 /root/go/pkg/mod/cache || true
 
-# 处理可能出现的负数 (如果清理过程中产生新日志)
-if [ $FREED_SPACE -lt 0 ]; then FREED_SPACE=0; fi
+  # /home users
+  for user_dir in /home/*; do
+    [[ -d "$user_dir" ]] || continue
+    run rm -rf "$user_dir/.cache/pip" "$user_dir/.npm" "$user_dir/.yarn" "$user_dir/.gradle" "$user_dir/.m2" "$user_dir/go/pkg/mod/cache" || true
+  done
 
-echo "------------------------------------------------"
-echo "初始已用: $(format_size $((START_USAGE * 1024)))"
-echo "最终已用: $(format_size $((END_USAGE * 1024)))"
-echo "本次释放: $(format_size $((FREED_SPACE * 1024)))"
-echo "------------------------------------------------"
-log_success "系统清理与优化完成！"
-echo ""
+  log_success "开发/构建缓存清理完成"
+}
 
-exit 0
+# ------------------------------ 清理：旧内核 ------------------------------
+clean_old_kernels() {
+  log_step "旧内核清理"
+  if ! $DO_KERNEL_CLEAN; then
+    log_info "模式/配置未启用旧内核清理，跳过"
+    return 0
+  fi
+  have_cmd dpkg || { log_warn "未发现 dpkg，跳过"; return 0; }
+  have_cmd apt-get || { log_warn "未发现 apt-get，跳过"; return 0; }
+
+  local current_kernel pkgs
+  current_kernel=$(uname -r)
+
+  # 仅清理 linux-image-*（更保守）；headers/modules 交给 autoremove
+  pkgs=$(dpkg --list | awk '/^ii  linux-image-[0-9]/{print $2}' | grep -v "${current_kernel}" || true)
+  if [[ -z "${pkgs}" ]]; then
+    log_info "未发现可清理的旧 linux-image 包"
+    return 0
+  fi
+
+  log_warn "将移除以下旧内核包（不会移除当前运行内核: $current_kernel）："
+  echo "$pkgs" | sed 's/^/  - /'
+
+  if confirm "确认移除旧内核包并 update-grub？"; then
+    # shellcheck disable=SC2086
+    run apt-get -y purge $pkgs
+    if have_cmd update-grub; then
+      run update-grub
+    fi
+    log_success "旧内核清理完成（建议稍后重启）"
+  else
+    log_info "跳过旧内核清理"
+  fi
+}
+
+# ------------------------------ 优化：sysctl ------------------------------
+apply_sysctl() {
+  local key="$1" val="$2"
+  run sysctl -w "$key=$val"
+  if $PERSIST_SYSCTL; then
+    # 幂等写入：已存在则替换
+    if [[ ! -f "$SYSCTL_DROPIN" ]]; then
+      run bash -c "umask 022; : > '$SYSCTL_DROPIN'"
+    fi
+    if grep -qE "^${key}=" "$SYSCTL_DROPIN" 2>/dev/null; then
+      run sed -i "s/^${key}=.*/${key}=${val}/" "$SYSCTL_DROPIN"
+    else
+      run bash -c "echo '${key}=${val}' >> '$SYSCTL_DROPIN'"
+    fi
+  fi
+}
+
+tune_sysctl() {
+  log_step "性能参数优化（sysctl）"
+  if ! $DO_SYSCTL_TUNE; then
+    log_info "已配置跳过 sysctl 优化"
+    return 0
+  fi
+  have_cmd sysctl || { log_warn "未发现 sysctl，跳过"; return 0; }
+
+  # 根据内存大小选择更保守参数
+  local mem_kb
+  mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+
+  if confirm "应用推荐 sysctl（swappiness/vfs_cache_pressure 等）并可持久化到 $SYSCTL_DROPIN？"; then
+    # swappiness：Docker 主机通常希望减少 swap 抖动
+    apply_sysctl vm.swappiness 10
+
+    # vfs_cache_pressure：内存足够时降低，让 inode/dentry 缓存保留更久
+    if [[ "$mem_kb" -ge 2000000 ]]; then
+      apply_sysctl vm.vfs_cache_pressure 50
+    else
+      log_info "内存较小（$((mem_kb/1024))MiB），保持默认 vfs_cache_pressure（不强行修改）"
+    fi
+
+    log_success "sysctl 优化完成"
+  else
+    log_info "跳过 sysctl 优化"
+  fi
+}
+
+# ------------------------------ 优化：fstrim ------------------------------
+fstrim_disks() {
+  log_step "fstrim（可选）"
+  if ! $DO_FSTRIM; then
+    log_info "未启用 fstrim，跳过"
+    return 0
+  fi
+  have_cmd fstrim || { log_warn "未发现 fstrim，跳过"; return 0; }
+
+  log_warn "fstrim 适用于支持 discard 的 SSD/云盘，可回收已删除块，可能提升长期性能。"
+  if confirm "执行 fstrim -av？"; then
+    run fstrim -av || true
+    log_success "fstrim 执行完成"
+  else
+    log_info "跳过 fstrim"
+  fi
+}
+
+# ------------------------------ 主流程 ------------------------------
+main() {
+  parse_args "$@"
+  apply_mode_defaults
+  need_root
+  setup_logging
+
+  local start end freed
+  start=$(bytes_used_rootfs)
+
+  print_detect
+
+  clean_apt
+  clean_docker_safe
+  clean_snap
+  clean_logs_and_tmp
+  clean_dev_caches_aggressive
+  clean_old_kernels
+  tune_sysctl
+  fstrim_disks
+
+  log_step "清理摘要"
+  end=$(bytes_used_rootfs)
+  if (( end > start )); then
+    freed=0
+  else
+    freed=$(( start - end ))
+  fi
+  echo "------------------------------------------------"
+  echo "初始已用: $(fmt_bytes "$start")"
+  echo "最终已用: $(fmt_bytes "$end")"
+  echo "本次释放: $(fmt_bytes "$freed")"
+  echo "日志文件: $LOG_FILE"
+  echo "------------------------------------------------"
+  log_success "完成"
+}
+
+main "$@"
