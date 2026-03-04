@@ -419,9 +419,18 @@ clean_logs_and_tmp() {
   fi
 
   # /tmp /var/tmp
+  # 注意：find -delete 删除目录要求“目录为空”，而临时目录下可能在清理过程中被进程写入，导致
+  # "Directory not empty" 并返回非 0，从而触发 set -e 中断脚本。
+  # 策略：
+  #  1) 先删除文件/软链接（安全、不会遇到目录非空问题）
+  #  2) 再删除空目录
+  #  3) 全程容错：即使有目录正在使用也不应中断整个清理
   if confirm "清理临时目录 /tmp 与 /var/tmp（删除 mtime>$TMP_DELETE_AFTER_DAYS 天的文件）？"; then
-    run find /tmp -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -delete
-    run find /var/tmp -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -delete
+    run find /tmp -xdev -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" \( -type f -o -type l \) -delete || true
+    run find /tmp -xdev -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -type d -empty -delete || true
+
+    run find /var/tmp -xdev -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" \( -type f -o -type l \) -delete || true
+    run find /var/tmp -xdev -mindepth 1 -mtime "+$TMP_DELETE_AFTER_DAYS" -type d -empty -delete || true
   fi
 
   # 用户缓存：safe 模式只清理 root 的 apt/pip 等常见缓存目录的“安全子集”
