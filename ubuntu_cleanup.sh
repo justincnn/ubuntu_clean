@@ -175,6 +175,13 @@ EOF
 }
 
 parse_args() {
+  # 这些 FORCE_* 用于确保用户显式开启的选项不被 mode 默认值覆盖
+  FORCE_KERNEL_CLEAN=false
+  FORCE_SNAP_CLEAN=false
+  FORCE_DEV_CACHE_CLEAN=false
+  FORCE_DOCKER_LOG_TRUNCATE=false
+  FORCE_APT_LISTS_CLEAN=false
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode)
@@ -188,15 +195,15 @@ parse_args() {
       --docker)
         DO_DOCKER_CLEAN=true; shift ;;
       --docker-log-truncate)
-        DO_DOCKER_LOG_TRUNCATE=true; shift ;;
+        DO_DOCKER_LOG_TRUNCATE=true; FORCE_DOCKER_LOG_TRUNCATE=true; shift ;;
       --kernel-clean)
-        DO_KERNEL_CLEAN=true; shift ;;
+        DO_KERNEL_CLEAN=true; FORCE_KERNEL_CLEAN=true; shift ;;
       --snap-clean)
-        DO_SNAP_CLEAN=true; shift ;;
+        DO_SNAP_CLEAN=true; FORCE_SNAP_CLEAN=true; shift ;;
       --dev-cache-clean)
-        DO_DEV_CACHE_CLEAN=true; shift ;;
+        DO_DEV_CACHE_CLEAN=true; FORCE_DEV_CACHE_CLEAN=true; shift ;;
       --apt-lists-clean)
-        DO_APT_LISTS_CLEAN=true; shift ;;
+        DO_APT_LISTS_CLEAN=true; FORCE_APT_LISTS_CLEAN=true; shift ;;
       --no-coredump-clean)
         DO_COREDUMP_CLEAN=false; shift ;;
       --fstrim)
@@ -252,6 +259,24 @@ apply_mode_defaults() {
       DO_APT_LISTS_CLEAN=true
       ;;
   esac
+
+  # 参数显式开启拥有最高优先级（允许在 safe 模式下启用这些清理项）
+  # 说明：parse_args() 先跑，apply_mode_defaults() 后跑；这里保证显式开关不被模式覆盖。
+  if [[ "${FORCE_KERNEL_CLEAN:-false}" == "true" ]]; then
+    DO_KERNEL_CLEAN=true
+  fi
+  if [[ "${FORCE_DEV_CACHE_CLEAN:-false}" == "true" ]]; then
+    DO_DEV_CACHE_CLEAN=true
+  fi
+  if [[ "${FORCE_SNAP_CLEAN:-false}" == "true" ]]; then
+    DO_SNAP_CLEAN=true
+  fi
+  if [[ "${FORCE_DOCKER_LOG_TRUNCATE:-false}" == "true" ]]; then
+    DO_DOCKER_LOG_TRUNCATE=true
+  fi
+  if [[ "${FORCE_APT_LISTS_CLEAN:-false}" == "true" ]]; then
+    DO_APT_LISTS_CLEAN=true
+  fi
 }
 
 print_detect() {
