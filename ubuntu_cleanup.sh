@@ -2,13 +2,13 @@
 # ==============================================================================
 # Ubuntu VPS 极速彻底清理脚本 
 # - 修正了在 Oracle VPS/Docker 环境下由于 overlay 挂载导致的统计不准问题
-# - 自动清理 APT、Docker、Snap、日志、缓存及旧内核
+# - 在摘要中新增：总硬盘容量、可用容量、清理前后对比
 # ==============================================================================
 
 set -Eeuo pipefail
 
 # ------------------------------ 输出/日志 ------------------------------
-LOG_FILE="/var/log/ubuntu_cleanup_fixed.log"
+LOG_FILE="/var/log/ubuntu_cleanup_enhanced.log"
 
 _color() { local c="$1"; shift; printf "\033[%sm%s\033[0m" "$c" "$*"; }
 log_info() { echo -e "$(_color 36 [INFO]) $(date '+%F %T') $*"; }
@@ -23,10 +23,11 @@ die() { log_error "$*"; exit 1; }
 need_root() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then die "请使用 root 权限运行：sudo bash $0"; fi; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# 核心修正：排除 overlay, tmpfs 等虚拟挂载点，避免重复计算 Docker 占用
-bytes_used_total() {
-    # 只统计物理磁盘分区，忽略 Docker 的叠加文件系统
-    df -P -l -x overlay -x tmpfs -x devtmpfs -x devfs -x squashfs 2>/dev/null | awk 'NR>1 {sum += $3} END {print sum * 1024}'
+# 获取磁盘统计数据 (返回字节: 总容量 已用 可用)
+# 使用 / 目录作为统计基准，这是 VPS 最核心的物理磁盘分区
+get_disk_stats() {
+    # 使用 1024 字节块 (-P 兼容性好)
+    df -P / 2>/dev/null | awk 'NR==2 {print $2*1024, $3*1024, $4*1024}'
 }
 
 fmt_bytes() {
@@ -117,9 +118,8 @@ main() {
     need_root
     setup_logging
 
-    local start end freed
-    # 记录初始空间
-    start=$(bytes_used_total)
+    # 记录初始状态 (读取为数组)
+    read -r start_total start_used start_free < <(get_disk_stats)
 
     log_warn "=== 开始极速清理 ==="
     
@@ -129,24 +129,29 @@ main() {
     clean_logs_and_tmp
     clean_old_kernels
 
-    # 关键步骤：同步磁盘，确保 df 获取的是释放后的真实数据
+    # 强制刷盘，确保系统更新磁盘统计信息
     log_info "正在同步文件系统状态..."
     sync && sleep 1
 
-    # 记录最终空间
-    end=$(bytes_used_total)
+    # 记录最终状态
+    read -r end_total end_used end_free < <(get_disk_stats)
     
-    # 计算释放量
-    if (( end > start )); then 
-        freed=0
-    else 
-        freed=$(( start - end ))
+    # 计算实际释放字节
+    local freed=0
+    if (( start_used > end_used )); then
+        freed=$(( start_used - end_used ))
     fi
 
     log_step "清理摘要"
     echo "------------------------------------------------"
-    echo "初始已用: $(fmt_bytes "$start")"
-    echo "最终已用: $(fmt_bytes "$end")"
+    echo "总硬盘容量:   $(fmt_bytes "$end_total")"
+    echo "------------------------------------------------"
+    echo "初始已用:     $(fmt_bytes "$start_used")"
+    echo "最终已用:     $(fmt_bytes "$end_used")"
+    echo "------------------------------------------------"
+    echo "初始可用:     $(fmt_bytes "$start_free")"
+    echo "最终可用:     $(fmt_bytes "$end_free")"
+    echo "------------------------------------------------"
     echo -e "\033[32m本次实际释放: $(fmt_bytes "$freed")\033[0m"
     echo "------------------------------------------------"
     log_success "清理完成！"
