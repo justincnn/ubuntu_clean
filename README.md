@@ -6,6 +6,8 @@
 - 优化系统参数：提供保守的 `sysctl` 调优（可选持久化）与 `fstrim`（可选）
 - 支持定期重复执行：提供 `safe|standard|aggressive` 三档强度 + `--dry-run` 预演
 
+本仓库同时提供一个独立的「VPS 自适应优化」脚本：`vps_tune.sh`（面向 Oracle OCI/通用云 VPS，ARM/x86 通用），用于提升系统效率与稳定性（不会做“清理磁盘”那类强破坏动作）。
+
 ## ✨ 功能特性
 
 - **三档强度**：
@@ -42,12 +44,51 @@
 
 ## 🚀 使用方法
 
+### A) VPS 自适应优化（推荐）
+
+脚本：`vps_tune.sh`
+
+- 先检查系统资源与能力（CPU/内存/磁盘/是否支持 TRIM/BBR/是否存在 Docker 等），再决定应用哪些优化。
+- 支持 `MODE=plan` 仅输出“将要做什么”，不改系统。
+- 默认不会做高风险操作（例如重启 Docker、卸载软件包）；这些需要显式开关。
+
+1) 只看检测与计划（不做任何改动）：
+
+```bash
+sudo -H MODE=plan bash vps_tune.sh
+```
+
+2) 按自适应策略应用（默认）：
+
+```bash
+sudo -H bash vps_tune.sh
+```
+
+3) 常用可选开关：
+
+```bash
+# 写入 Docker 日志轮转后自动重启 docker（会短暂影响容器）
+sudo -H RESTART_DOCKER=1 bash vps_tune.sh
+
+# 显式停用“候选无用服务”（默认关闭，建议先 plan 再开）
+sudo -H APPLY_DISABLE_CANDIDATES=1 bash vps_tune.sh
+
+# 显式停用并 purge 候选包（风险最高；默认关闭）
+sudo -H APPLY_DISABLE_CANDIDATES=1 APPLY_PURGE_CANDIDATE_PACKAGES=1 bash vps_tune.sh
+
+# 小内存实例启用 ZRAM；如系统缺少 zram-generator，允许脚本尝试安装
+sudo -H APPLY_ZRAM=1 INSTALL_ZRAM=1 bash vps_tune.sh
+```
+
+说明：脚本会写入 drop-in 配置文件（例如 `/etc/sysctl.d/`、`/etc/systemd/*.conf.d/`），可重复运行（幂等）。
+
 ### 1) 下载并赋予执行权限
 
 ```bash
 git clone https://github.com/justincnn/ubuntu_clean.git
 cd ubuntu_clean
 chmod +x ubuntu_cleanup.sh
+chmod +x vps_tune.sh
 ```
 
 ### 2) 推荐：先 dry-run 预演
