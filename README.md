@@ -1,86 +1,40 @@
 # Ubuntu System Cleanup Script
 
-一个用于 **Ubuntu / Debian VPS** 的 Bash 脚本：
+一个用于 **Ubuntu / Debian VPS** 的 Bash 清理脚本：
 
-- 释放磁盘空间：APT、日志、临时目录、用户缓存、Snap（可选）、Docker（安全模式）等
-- 优化系统参数：提供保守的 `sysctl` 调优（可选持久化）与 `fstrim`（可选）
-- 支持定期重复执行：提供 `safe|standard|aggressive` 三档强度 + `--dry-run` 预演
-
-本仓库同时提供一个独立的「VPS 自适应优化」脚本：`vps_tune.sh`（面向 Oracle OCI/通用云 VPS，ARM/x86 通用），用于提升系统效率与稳定性（不会做“清理磁盘”那类强破坏动作）。
+- 释放磁盘空间：APT、日志、临时目录、用户缓存、Snap（可选）、Docker（安全模式）、开发缓存（可选）等
+- 默认安全：不删 Docker 卷、不清空全部日志、危险操作需显式开关
+- 支持 `--dry-run` 预演、`--yes` 自动确认、清理前后磁盘对比报告
 
 ## ✨ 功能特性
 
-- **三档强度**：
-  - `safe`（默认）：安全清理与保守优化，适合日常/定期运行
-  - `standard`：更积极（默认包含旧内核清理、Snap disabled 旧版本清理、Docker 容器 json 日志截断等）
-  - `aggressive`：尽可能释放空间（可能清理更多缓存/残留），适合“我知道我在做什么”的场景
-- **可重复执行**：大多数操作幂等；`sysctl` 采用 drop-in 文件持久化（默认写入 `/etc/sysctl.d/99-ubuntu-cleanup.conf`）
-- **Docker 安全策略**：默认**不删除容器**、**不删除卷**、**不删除命名镜像**；仅清理悬空镜像、构建缓存、未使用网络；可选截断 `*-json.log`
-- **日志与临时文件**：
-  - `journalctl --vacuum-*`（先 `--rotate`，让清理更彻底）
-  - 删除旧的轮转/压缩日志（`/var/log/*.gz|*.xz|*.bz2|*.log.N`）
-  - 截断超大 `.log` 文件（保留文件名更安全）
-  - `systemd-tmpfiles --clean` + 清理 `/tmp` 与 `/var/tmp`
-- **崩溃/核心转储清理**：可选清理 `/var/lib/systemd/coredump` 与 `/var/crash`
-- **交互确认 + 自动确认**：默认逐步确认；支持 `--yes` / `AUTO_CONFIRM=true`
+- **默认安全策略**：
+  - Docker 清理**不删除卷、不删除命名镜像**（仅清理悬空镜像、构建缓存、未使用网络）
+  - journald 日志**保留最近 7 天**（`--vacuum-time=7d`），不全部清空
+  - 轮转日志（`*.gz` / `*.log.N` 等）**截断而非删除**（保留文件名，避免影响占用进程）
+  - 旧内核清理、开发缓存清理默认**关闭**，需显式 `--kernel-clean` / `--dev-cache` 开启
+- **开发缓存清理**（可选，`--dev-cache`）：pip / npm / Go 构建缓存 / uv 缓存
+- **大缓存报告**：Playwright / Camoufox 等浏览器引擎缓存**仅报告占用**，不自动清理（删除后需重新下载）
+- **可重复执行**：所有操作幂等，可定期运行
+- **清理报告**：展示总容量、初始/最终已用与可用、本次实际释放量
 
 ## ⚠️ 重要警告
 
-- 请谨慎使用：它会永久删除文件或卸载软件包。
-- 强烈建议运行前备份重要数据。
-- 需要 root 权限：用 `sudo` 执行。
-- `--mode aggressive` 与 `--dev-cache-clean` 可能会删除开发/构建缓存，导致下次构建/安装变慢。
-- `--kernel-clean` 会移除旧内核包；通常安全，但建议维护窗口执行，完成后可重启。
+- 请谨慎使用：它会永久删除文件或卸载软件包
+- 强烈建议运行前备份重要数据
+- 需要 root 权限：用 `sudo` 执行
+- `--dev-cache` 会删除开发/构建缓存（pip/npm/go/uv），导致下次构建/安装变慢
+- `--kernel-clean` 会移除旧内核包；通常安全，但建议维护窗口执行，完成后可重启
+- `--prune-volumes` 会删除 Docker 未使用卷，**可能造成数据丢失**，仅在明确知晓时使用
 
 ## ⚙️ 系统要求
 
 - Ubuntu 或 Debian 系统
 - `bash`、`find`、`awk`、`sed`、`df` 等基础工具
-- `apt-get`/`dpkg`（用于 APT/内核相关清理）
-- 可选：`docker`（Docker 清理）
-- 可选：`snap`（Snap 清理）
+- 可选：`docker`（Docker 清理）、`snap`（Snap 清理）
 - 可选：`journalctl`（journald 清理）
-- 可选：`fstrim`（SSD/云盘 trim）
 
 ## 🚀 使用方法
-
-### A) VPS 自适应优化（推荐）
-
-脚本：`vps_tune.sh`
-
-- 先检查系统资源与能力（CPU/内存/磁盘/是否支持 TRIM/BBR/是否存在 Docker 等），再决定应用哪些优化。
-- 支持 `MODE=plan` 仅输出“将要做什么”，不改系统。
-- 默认不会做高风险操作（例如重启 Docker、卸载软件包）；这些需要显式开关。
-
-1) 只看检测与计划（不做任何改动）：
-
-```bash
-sudo -H MODE=plan bash vps_tune.sh
-```
-
-2) 按自适应策略应用（默认）：
-
-```bash
-sudo -H bash vps_tune.sh
-```
-
-3) 常用可选开关：
-
-```bash
-# 写入 Docker 日志轮转后自动重启 docker（会短暂影响容器）
-sudo -H RESTART_DOCKER=1 bash vps_tune.sh
-
-# 显式停用“候选无用服务”（默认关闭，建议先 plan 再开）
-sudo -H APPLY_DISABLE_CANDIDATES=1 bash vps_tune.sh
-
-# 显式停用并 purge 候选包（风险最高；默认关闭）
-sudo -H APPLY_DISABLE_CANDIDATES=1 APPLY_PURGE_CANDIDATE_PACKAGES=1 bash vps_tune.sh
-
-# 小内存实例启用 ZRAM；如系统缺少 zram-generator，允许脚本尝试安装
-sudo -H APPLY_ZRAM=1 INSTALL_ZRAM=1 bash vps_tune.sh
-```
-
-说明：脚本会写入 drop-in 配置文件（例如 `/etc/sysctl.d/`、`/etc/systemd/*.conf.d/`），可重复运行（幂等）。
 
 ### 1) 下载并赋予执行权限
 
@@ -88,52 +42,57 @@ sudo -H APPLY_ZRAM=1 INSTALL_ZRAM=1 bash vps_tune.sh
 git clone https://github.com/justincnn/ubuntu_clean.git
 cd ubuntu_clean
 chmod +x ubuntu_cleanup.sh
-chmod +x vps_tune.sh
 ```
 
-### 2) 推荐：先 dry-run 预演
+### 2) 推荐：先 dry-run 预演（不改动系统）
 
 ```bash
-sudo ./ubuntu_cleanup.sh --mode safe --dry-run
+sudo ./ubuntu_cleanup.sh --dry-run
 ```
 
-### 3) 日常定期清理（安全默认）
+### 3) 日常清理（默认安全配置）
 
 ```bash
-sudo ./ubuntu_cleanup.sh --mode safe
+sudo ./ubuntu_cleanup.sh --yes
 ```
 
-### 4) 标准清理（更积极）
+> `--yes` 跳过确认；不加则会在执行前做一次全局确认。
+
+### 4) 更完整的清理（含开发缓存）
 
 ```bash
-sudo ./ubuntu_cleanup.sh --mode standard
+sudo ./ubuntu_cleanup.sh --dev-cache --yes
 ```
 
-### 5) 激进清理（谨慎）
+## 🔧 参数说明
 
-```bash
-sudo ./ubuntu_cleanup.sh --mode aggressive
-```
+| 参数 | 说明 |
+|---|---|
+| `--dry-run` | 预演模式：只打印将执行的命令，不实际改动系统 |
+| `--yes` | 跳过所有确认（等同 `AUTO_CONFIRM=true`）|
+| `--no-docker` | 跳过 Docker 清理 |
+| `--dev-cache` | 清理开发缓存（pip/npm/go/uv，默认关闭）|
+| `--prune-volumes` | Docker 清理时同时删除未使用卷（**默认保留，有数据丢失风险**）|
+| `--kernel-clean` | 清理旧内核（默认关闭，建议维护窗口执行）|
+| `--keep-log-days N` | journald 日志保留天数（默认 7）|
+| `--log-file PATH` | 指定日志文件（默认 `/var/log/ubuntu_cleanup.log`）|
+| `--help` | 显示帮助 |
 
-## 🔧 常用参数
+## 📋 清理内容明细
 
-- `--yes`：跳过交互确认（等同 `AUTO_CONFIRM=true`）
-- `--no-docker`：跳过 Docker 清理
-- `--kernel-clean`：清理旧内核
-- `--snap-clean`：清理 Snap disabled 旧版本（检测到 snap 才生效）
-- `--dev-cache-clean`：清理常见开发缓存（pip/npm/gradle/maven 等）
-- `--fstrim`：执行 `fstrim -av`
-- `--log-file /path/to/log`：指定日志文件
-
-查看完整帮助：
-
-```bash
-sudo ./ubuntu_cleanup.sh --help
-```
+| 模块 | 清理内容 | 默认 |
+|---|---|---|
+| 1. APT | `dpkg --configure -a`、`apt-get autoremove/autoclean/clean`、清空 apt lists | ✅ 开启 |
+| 2. Docker | 悬空镜像、构建缓存、未使用网络；容器 json 日志截断（**不删卷**）| ✅ 开启 |
+| 3. Snap | 清理 disabled 旧版本（`refresh.retain=2`）| ✅ 检测到才执行 |
+| 4. 日志/tmp | journald 保留 7 天、轮转日志截断、`/tmp` `/var/tmp` 文件+空目录清理 | ✅ 开启 |
+| 5. 旧内核 | 移除旧内核包（保留当前 + 最新）| ❌ 需 `--kernel-clean` |
+| 6. 开发缓存 | pip / npm / Go / uv 缓存 | ❌ 需 `--dev-cache` |
+| 7. 大缓存报告 | Playwright / Camoufox 等浏览器缓存（仅报告）| ✅ 只报告不清理 |
 
 ## ⏱️ 定时运行（可选）
 
-### 方案 A：cron（每周日凌晨 3 点，safe + 自动确认）
+### 方案 A：cron（每周日凌晨 3 点，自动确认）
 
 ```bash
 sudo crontab -e
@@ -142,16 +101,12 @@ sudo crontab -e
 加入：
 
 ```cron
-0 3 * * 0 AUTO_CONFIRM=true /path/to/ubuntu_clean/ubuntu_cleanup.sh --mode safe --log-file /var/log/ubuntu_cleanup.log
+0 3 * * 0 /path/to/ubuntu_clean/ubuntu_cleanup.sh --yes --log-file /var/log/ubuntu_cleanup.log
 ```
 
 ### 方案 B：systemd timer（推荐，日志更友好）
 
-可自行创建一个 `oneshot` service + timer，定期执行：
-
-- `AUTO_CONFIRM=true`
-- `--mode safe`
-- `--log-file /var/log/ubuntu_cleanup.log`
+创建一个 `oneshot` service + timer，定期执行 `ubuntu_cleanup.sh --yes` 即可。
 
 ## 许可证
 
